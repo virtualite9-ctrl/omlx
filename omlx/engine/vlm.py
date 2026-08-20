@@ -892,7 +892,39 @@ def _transpose_qwen35_mlx_vision_patch_embed_on_load(model_dir: Path):
 
 
 _NESTED_VIS_PREFIX = "language_model.model.visual."
+_MODEL_VIS_PREFIX = "model.visual."
 _VISION_TOWER_PREFIX = "vision_tower."
+
+
+def _remap_visual_weight_key(key: str) -> str:
+    """Map MLX-format Qwen3.5-family visual keys to mlx-vlm's module path."""
+    for source_prefix in (_NESTED_VIS_PREFIX, _MODEL_VIS_PREFIX):
+        if key.startswith(source_prefix):
+            return _VISION_TOWER_PREFIX + key[len(source_prefix) :]
+    return key
+
+
+def _remap_visual_weight_items(weights_items):
+    """Remap visual keys and raw PyTorch Conv3D layout for mlx-vlm."""
+    if isinstance(weights_items, str):
+        return weights_items, 0, 0
+    remapped = []
+    changed = 0
+    transposed = 0
+    for key, value in weights_items:
+        mapped_key = _remap_visual_weight_key(key)
+        changed += mapped_key != key
+        shape = getattr(value, "shape", ())
+        if (
+            mapped_key == "vision_tower.patch_embed.proj.weight"
+            and len(shape) == 5
+            and shape[1] == 3
+            and shape[-1] != 3
+        ):
+            value = value.transpose(0, 2, 3, 4, 1)
+            transposed += 1
+        remapped.append((mapped_key, value))
+    return remapped, changed, transposed
 
 
 def _should_pack_minimax_m3_shared_expert(args: Any) -> bool:
@@ -1035,20 +1067,38 @@ def _force_minimax_m3_moe_sanitize_on_load(model_dir: Path):
 
 @contextlib.contextmanager
 def _remap_nested_visual_on_load(model_dir: Path):
-    """Remap ``language_model.model.visual.*`` → ``vision_tower.*`` during
-    ``load_model`` for MLX-format models where sanitize is skipped.
+    """Remap Qwen3.5-family visual keys for MLX-format VLM checkpoints.
 
-    mlx-vlm's ``load_model`` skips ``Model.sanitize`` when the safetensors
-    metadata declares ``format=mlx``. oQ output is MLX-format, so the
-    nested-visual key fixup that sanitize normally applies never fires.
-    This context manager wraps ``load_model`` to intercept the weight dict
-    and perform the remap before ``nn.Module.load_weights`` is called.
+    mlx-vlm skips ``Model.sanitize`` when safetensors metadata declares
+    ``format=mlx``. Converted checkpoints use either
+    ``language_model.model.visual.*`` or ``model.visual.*``; both must become
+    ``vision_tower.*``. Patch both the generic module loader and the concrete
+    Qwen outer model loader because MTP runtime wrappers can capture and bypass
+    a later ``nn.Module.load_weights`` monkeypatch.
 
     Scoped to a single ``vlm_load(...)`` call.
     """
+    import importlib
+
     import mlx_vlm.utils as _vu
 
     original_load_model = _vu.load_model
+
+    def _log_remap(count: int, transposed: int, boundary: str) -> None:
+        if count:
+            logger.info(
+                "remap_nested_visual_on_load: remapped %d Qwen visual keys "
+                "to 'vision_tower.*' at %s",
+                count,
+                boundary,
+            )
+        if transposed:
+            logger.info(
+                "remap_nested_visual_on_load: transposed %d Qwen patch-embed "
+                "Conv3D kernel to MLX layout at %s",
+                transposed,
+                boundary,
+            )
 
     def _patched_load_model(model_path, lazy=False, **kwargs):
         import mlx.nn as _nn
@@ -1056,21 +1106,8 @@ def _remap_nested_visual_on_load(model_dir: Path):
         orig_load_weights = _nn.Module.load_weights
 
         def _remapping_load_weights(self, weights_items, *args, **kw):
-            if isinstance(weights_items, str):
-                return orig_load_weights(self, weights_items, *args, **kw)
-            remapped = []
-            n = 0
-            for k, v in weights_items:
-                if k.startswith(_NESTED_VIS_PREFIX):
-                    k = _VISION_TOWER_PREFIX + k[len(_NESTED_VIS_PREFIX) :]
-                    n += 1
-                remapped.append((k, v))
-            if n:
-                logger.info(
-                    "remap_nested_visual_on_load: remapped %d keys "
-                    "'language_model.model.visual.*' -> 'vision_tower.*'",
-                    n,
-                )
+            remapped, count, transposed = _remap_visual_weight_items(weights_items)
+            _log_remap(count, transposed, "nn.Module.load_weights")
             return orig_load_weights(self, remapped, *args, **kw)
 
         _nn.Module.load_weights = _remapping_load_weights
@@ -1080,10 +1117,38 @@ def _remap_nested_visual_on_load(model_dir: Path):
             _nn.Module.load_weights = orig_load_weights
 
     _vu.load_model = _patched_load_model
+    patched_outer_loaders = []
+    model_type = _read_config_model_type(model_dir) or ""
+    module_name = {
+        "qwen3_5": "mlx_vlm.models.qwen3_5",
+        "qwen3_5_moe": "mlx_vlm.models.qwen3_5_moe",
+    }.get(model_type)
+    if module_name:
+        try:
+            outer_module = importlib.import_module(module_name)
+            outer_cls = outer_module.Model
+            original_outer_load_weights = outer_cls.load_weights
+
+            def _outer_remapping_load_weights(self, weights_items, *args, **kwargs):
+                remapped, count, transposed = _remap_visual_weight_items(weights_items)
+                _log_remap(
+                    count,
+                    transposed,
+                    f"{module_name}.Model.load_weights",
+                )
+                return original_outer_load_weights(self, remapped, *args, **kwargs)
+
+            outer_cls.load_weights = _outer_remapping_load_weights
+            patched_outer_loaders.append((outer_cls, original_outer_load_weights))
+        except Exception:
+            logger.debug("Could not patch Qwen outer VLM loader", exc_info=True)
+
     try:
         yield
     finally:
         _vu.load_model = original_load_model
+        for outer_cls, original_outer_load_weights in patched_outer_loaders:
+            outer_cls.load_weights = original_outer_load_weights
 
 
 # Models that only support a single image per request
