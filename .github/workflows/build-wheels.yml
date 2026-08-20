@@ -25,10 +25,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # Local PR #2892 deployment targets the pinned CPython 3.11 runtime.
+        python-version: ["3.11"]
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Verify Metal toolchain
+        run: |
+          if ! xcrun -f metal >/dev/null 2>&1 || ! xcrun -f metallib >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun --kill-cache
+          fi
+          xcrun -f metal
+          xcrun -f metallib
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -61,12 +71,24 @@ jobs:
           /tmp/wheel-smoke/bin/python - <<'PY'
           import importlib
           failed = []
+          loaded = {}
           for pkg in ("bonsai", "glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
               fast = importlib.import_module(f"omlx.custom_kernels.{pkg}.fast")
+              loaded[pkg] = fast
               ok = bool(fast.is_native_available())
               print(f"{pkg}: native_available={ok} import_error={fast.import_error()}")
               if not ok:
                   failed.append(pkg)
+          qfast = loaded["qwen35_prefill"]
+          required = (
+              "qwen35_cpu_fp16_affine_qmm_t",
+              "qwen35_ane_cpu_fp16_q4_swiglu_t",
+              "qwen35_ane_dual_cpu_fp16_q4_swiglu_t",
+          )
+          missing = [name for name in required if not qfast.has_symbol(name)]
+          print(f"qwen35 CPU-sharing symbols missing={missing}")
+          if missing:
+              failed.append(f"qwen35 symbols: {missing}")
           raise SystemExit(f"native kernels missing from wheel: {failed}" if failed else 0)
           PY
 
